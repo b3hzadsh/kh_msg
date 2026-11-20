@@ -1,0 +1,138 @@
+name: Build and Release Flutter App
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ------------------------------------------------------------------
+      # 1. Java + Flutter setup
+      # ------------------------------------------------------------------
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: 3.47.1
+          channel: stable
+          cache: true
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      # ------------------------------------------------------------------
+      # 5. Decode signing keystore (signs both APK and AAB)
+      # ------------------------------------------------------------------
+      - name: Decode and create keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ] || [ -z "$KEYSTORE_PASSWORD" ] || [ -z "$KEY_PASSWORD" ] || [ -z "$KEY_ALIAS" ]; then
+            echo "::error::Missing signing secrets. Required: KEYSTORE_BASE64, KEYSTORE_PASSWORD, KEY_PASSWORD, KEY_ALIAS"
+            exit 1
+          fi
+          mkdir -p android/app
+          echo "$KEYSTORE_BASE64" | base64 --decode > android/app/key.jks
+          cat <<EOF > android/key.properties
+          storePassword=$KEYSTORE_PASSWORD
+          keyPassword=$KEY_PASSWORD
+          keyAlias=$KEY_ALIAS
+          storeFile=key.jks
+          EOF
+
+      # ------------------------------------------------------------------
+      # 6. Build split APK + AAB (sequential; AAB reuses resolved deps)
+      # ------------------------------------------------------------------
+      - name: Build Release APK (split per ABI)
+        run: >
+          flutter build apk --release --split-per-abi
+          --obfuscate --split-debug-info=build/debug-info
+
+      - name: Build Release App Bundle (AAB)
+        run: flutter build appbundle --release --obfuscate --split-debug-info=build/debug-info
+
+      # ------------------------------------------------------------------
+      # 7. Upload artifacts
+      # ------------------------------------------------------------------
+      - name: Upload APK artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-release
+          path: build/app/outputs/flutter-apk/*.apk
+          retention-days: 30
+
+      - name: Upload AAB artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: appbundle-release
+          path: build/app/outputs/bundle/release/app-release.aab
+          retention-days: 30
+
+  # ----------------------------------------------------------------------
+  # 8. Create GitHub Release
+  # ----------------------------------------------------------------------
+  create-release:
+    needs: build-android
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release-assets
+          find . \( -name "*.apk" -o -name "*.aab" \) -print | xargs -I {} cp {} release-assets/
+          ls -la release-assets/
+
+      - name: Create GitHub Release
+        id: create_release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ github.ref_name }}
+          name: "kids_hobby ${{ github.ref_name }}"
+          body: |
+            kids_hobby release version ${{ github.ref_name }}
+
+            Download for Android:
+            • AAB file (for Google Play and Myket)
+            • Split APKs for different ABIs (arm64-v8a, armeabi-v7a, x86_64)
+
+            What's New:
+            - Initial release or latest updates
+            - Bug fixes and performance improvements
+          artifacts: "release-assets/*"
+          allowUpdates: true
+          replacesArtifacts: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+     
